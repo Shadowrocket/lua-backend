@@ -11,10 +11,8 @@ local find = string.find
 local sub = string.sub
 local rep = string.rep
 local format = string.format
-local print = print
-local type = type
-local pairs = pairs
-local tostring = tostring
+local random = math.random
+local floor = math.floor
 
 local ADDRESS = backend.ADDRESS
 local PROXY = backend.PROXY
@@ -22,6 +20,7 @@ local SUPPORT = backend.SUPPORT
 local ERROR = backend.RESULT.ERROR
 local SUCCESS = backend.RESULT.SUCCESS
 local IGNORE = backend.RESULT.IGNORE
+local HANDSHAKE = backend.RESULT.HANDSHAKE
 
 local ctx_uuid = backend.get_uuid
 local ctx_proxy_type = backend.get_proxy_type
@@ -31,14 +30,8 @@ local ctx_address_bytes = backend.get_address_bytes
 local ctx_address_port = backend.get_address_port
 local ctx_write = backend.write
 local ctx_free = backend.free
+local debug = backend.debug
 local htons = network.htons
-
-local SOCKS_STAGE_NONE = 0
-local SOCKS_STAGE_HANDSHAKE = 1
-local SOCKS_STAGE_AUTH = 2
-local SOCKS_STAGE_CONNECT = 3
-local SOCKS_STAGE_DONE = 4
-local SOCKS_STAGE_ERROR = 5
 
 local supported_ciphers = {
     ['aes-128-cfb'] = {key=16, iv=16},
@@ -60,138 +53,133 @@ local supported_ciphers = {
     ['seed-cfb'] = {key=16, iv=16},
 }
 
+
+local cache = {}
+local rand = crypto.rand
+local encrypt = crypto.encrypt
+local decrypt = crypto.decrypt
+
 local algorithm = settings.method
 local password = settings.password
 local key_len = supported_ciphers[algorithm].key
 local iv_len = supported_ciphers[algorithm].iv
-local key = password
+local key
 
 if #password > key_len then
-    key = string.sub(password, key_len)
+    key = sub(password, 1, key_len)
 elseif #password < key_len then
-    local len = math.floor(key_len / #password) + 1
-    key = string.sub(string.rep(password, len), 0, key_len)
-end
-
-local encrypts = {}
-local decrypts = {}
-local buffers = {}
-local flags = {}
-local rand = crypto.rand
-
-local function tprint (tbl, indent)
-    if not indent then
-        indent = 0
-    end
-    for k, v in pairs(tbl) do
-        formatting = rep("  ", indent) .. k .. ": "
-        if type(v) == "table" then
-            print(formatting)
-            tprint(v, indent + 4)
-        else
-            print(formatting .. tostring(v))
-        end
-    end
-end
-
-function tohex(s)
-    return (s:gsub('.', function (c) return format("%02x,", byte(c)) end))
+    local len = floor(key_len / #password) + 1
+    key = sub(rep(password, len), 1, key_len)
+else
+    key = password
 end
 
 local function wa_lua_handshake(ctx)
     local uuid = ctx_uuid(ctx)
-    local proxy_type = ctx_proxy_type(ctx)
-
+    local item = cache[uuid]
     local iv = rand.bytes(iv_len)
-    encrypt_ctx = crypto.encrypt.new(algorithm, key, iv)
-    encrypts[uuid] = encrypt_ctx
-
     local atyp = ctx_address_type(ctx)
     local port = htons(ctx_address_port(ctx))
-    local data = char(5, 0, 5, 1, 0, atyp)
-    local encrypt = crypto.encrypt.new(algorithm, key, iv)
-    local p1
+    local len = random(255)
+    local padding = rand.bytes(len)
+    local address
 
     if atyp == ADDRESS.DOMAIN then
         local host = ctx_address_host(ctx)
-        p1 = encrypt:update(data .. char(#host) .. host .. port)
+        address = char(#host) .. host .. port
     else
         local addr = ctx_address_bytes(ctx)
-        p1 = encrypt:update(data .. addr .. port)
+        address = addr .. port
     end
 
-    local p2 = encrypt:final()
-    local res = iv .. p1 .. p2
+    local cryptor = encrypt.new(algorithm, key, iv)
+    local data = char(5) .. char(len) .. padding .. char(5, 1, 0, atyp) .. address
+    local payload = cryptor:update(data) .. cryptor:final()
 
-    return SUCCESS, res
+    cryptor = encrypt.new(algorithm, key, iv)
+
+    item['head'] = #address + 4
+    item['cryptor'] = cryptor
+
+    return iv .. payload
 end
 
-function wa_lua_support_flags(settings)
-    return 4
-end
-
-function wa_lua_on_connect_cb(ctx, buf)
+function wa_lua_on_flags_cb(ctx)
     local uuid = ctx_uuid(ctx)
-    local proxy_type = ctx_proxy_type(ctx)
+    cache[uuid] = {}
+    return 0
+end
 
-    if proxy_type == PROXY.HTTP_TUNNEL then
-        flags[uuid] = SOCKS_STAGE_NONE
-        return SUCCESS, buf
-    else
-        buffers[uuid] = buf
-        flags[uuid] = SOCKS_STAGE_CONNECT
-        return wa_lua_handshake(ctx)
+function wa_lua_on_handshake_cb(ctx)
+    local uuid = ctx_uuid(ctx)
+    local item = cache[uuid]
+
+    if item['stage'] == 'handshake' then
+        return true
     end
+
+    if not item['stage'] then
+        item['stage'] = 'connect'
+        local res = wa_lua_handshake(ctx)
+        ctx_write(ctx, res)
+    end
+
+    return false
 end
 
 function wa_lua_on_read_cb(ctx, buf)
     local uuid = ctx_uuid(ctx)
-    local encrypt_ctx = encrypts[uuid]
-    local decrypt_ctx = decrypts[uuid]
-    local res = ""
+    local item = cache[uuid]
 
-    if not decrypt_ctx then
-        local riv = sub(buf, 0, iv_len)
-        local text = sub(buf, iv_len + 1)
-        decrypt_ctx = crypto.decrypt.new(algorithm, key, riv)
-        decrypts[uuid] = decrypt_ctx
+    if not item['decryptor'] then
+        local head = item['head']
+
+        if not head then
+            return ERROR, nil
+        end
+
+        if #buf < iv_len then
+            return ERROR, nil
+        end
+
+        local iv = sub(buf, 1, iv_len)
+        local decryptor = decrypt.new(algorithm, key, iv)
+        local data = sub(buf, iv_len + 1)
+        local text = decryptor:update(data)
+        local padding = byte(text, 1)
+        local len = iv_len + 1 + padding + head
+
+        if len ~= #buf then
+            return ERROR, nil
+        end
+
+        decryptor = decrypt.new(algorithm, key, iv)
+
+        item['stage'] = 'handshake'
+        item['decryptor'] = decryptor
+
+        return HANDSHAKE, nil
     else
-        res = decrypt_ctx:update(buf)
+        local decryptor = item['decryptor']
+        local res = decryptor:update(buf)
+        return SUCCESS, res
     end
 
-    if buffers[uuid] and flags[uuid] == SOCKS_STAGE_CONNECT then
-        local data = buffers[uuid]
-        local encryptd = encrypt_ctx:update(data)
-        flags[uuid] = SOCKS_STAGE_DONE
-        ctx_write(ctx, encryptd, function (ctx)
-            buffers[uuid] = nil
-        end)
-        return IGNORE, res
-    end
-
-    return SUCCESS, res
 end
 
 function wa_lua_on_write_cb(ctx, buf)
     local uuid = ctx_uuid(ctx)
-
-    if flags[uuid] == SOCKS_STAGE_NONE then
-        buffers[uuid] = buf
-        flags[uuid] = SOCKS_STAGE_CONNECT
-        return wa_lua_handshake(ctx)
-    else
-        local encrypt_ctx = encrypts[uuid]
-        return SUCCESS, encrypt_ctx:update(buf)
-    end
-
+    local item = cache[uuid]
+    local cryptor = item['cryptor']
+    local res = cryptor:update(buf)
+    return SUCCESS, res
 end
 
 function wa_lua_on_close_cb(ctx)
     local uuid = ctx_uuid(ctx)
-    encrypts[uuid] = nil
-    decrypts[uuid] = nil
-    buffers[uuid] = nil
-    flags[uuid] = nil
+    if cache[uuid] then
+        cache[uuid] = nil
+    end
     ctx_free(ctx)
     return SUCCESS
 end
